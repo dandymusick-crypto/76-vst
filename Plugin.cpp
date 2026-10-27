@@ -2,7 +2,6 @@
 #include <BinaryData.h>
 
 //==============================================================================
-// LookAndFeel minimalista para dibujar indicadores sobre el hardware 3D
 class Dandy76LookAndFeel : public juce::LookAndFeel_V4
 {
 public:
@@ -15,15 +14,14 @@ public:
         auto centreY = (float)y + (float)height * 0.5f;
         auto angle = rotaryStartAngle + sliderPos * (rotaryEndAngle - rotaryStartAngle);
 
-        // Arco sutil exterior y línea indicadora
         juce::Path arc;
         arc.addCentredArc(centreX, centreY, radius, radius, 0.0f, rotaryStartAngle, angle, true);
-        g.setColour(juce::Colours::orange.withAlpha(0.75f));
+        g.setColour(juce::Colours::orange.withAlpha(0.85f));
         g.strokePath(arc, juce::PathStrokeType(2.5f));
 
         juce::Path pointer;
         pointer.addRectangle(-1.5f, -radius, 3.0f, radius * 0.35f);
-        g.setColour(juce::Colours::white.withAlpha(0.9f));
+        g.setColour(juce::Colours::white.withAlpha(0.95f));
         g.fillPath(pointer, juce::AffineTransform::rotation(angle).translated(centreX, centreY));
     }
 
@@ -32,9 +30,9 @@ public:
     {
         if (b.getToggleState())
         {
-            g.setColour(juce::Colours::orange.withAlpha(0.45f));
+            g.setColour(juce::Colours::orange.withAlpha(0.5f));
             g.fillRoundedRectangle(b.getLocalBounds().toFloat(), 4.0f);
-            g.setColour(juce::Colours::white.withAlpha(0.8f));
+            g.setColour(juce::Colours::white.withAlpha(0.9f));
             g.drawRoundedRectangle(b.getLocalBounds().toFloat(), 4.0f, 1.5f);
         }
         else if (shouldDrawButtonAsHighlighted)
@@ -53,7 +51,8 @@ public:
         : AudioProcessor(BusesProperties()
                          .withInput("Input", juce::AudioChannelSet::stereo(), true)
                          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-          apvts(*this, nullptr, "Parameters", createParameterLayout())
+          apvts(*this, nullptr, "Parameters", createParameterLayout()),
+          oversampler(getTotalNumInputChannels(), 1, juce::dsp::Oversampler<float>::filterHalfBandFIRExpensive)
     {
     }
 
@@ -62,13 +61,19 @@ public:
     void prepareToPlay(double sampleRate, int samplesPerBlock) override
     {
         currentSampleRate = sampleRate;
+        
         juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32)samplesPerBlock, (juce::uint32)getTotalNumOutputChannels() };
         scFilter.prepare(spec);
         scFilter.setType(juce::dsp::StateVariableTPTFilterType::highpass);
+
+        oversampler.initProcessing(samplesPerBlock);
         envelope = 0.0f;
     }
 
-    void releaseResources() override {}
+    void releaseResources() override
+    {
+        oversampler.reset();
+    }
 
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override
     {
@@ -88,41 +93,48 @@ public:
             return;
         }
 
-        const float inParam  = apvts.getRawParameterValue("INPUT")->load();     // 0..50
-        const float outParam = apvts.getRawParameterValue("OUTPUT")->load();    // 0..50
-        const float attParam = apvts.getRawParameterValue("ATTACK")->load();    // 1..7 (1=Fast, 7=Slow)
-        const float relParam = apvts.getRawParameterValue("RELEASE")->load();   // 1..7 (1=Fast, 7=Slow)
-        const int ratioIdx   = (int)apvts.getRawParameterValue("RATIO")->load();// 0..4
+        const float inParam  = apvts.getRawParameterValue("INPUT")->load();     
+        const float outParam = apvts.getRawParameterValue("OUTPUT")->load();    
+        const float attParam = apvts.getRawParameterValue("ATTACK")->load();    
+        const float relParam = apvts.getRawParameterValue("RELEASE")->load();   
+        const int ratioIdx   = (int)apvts.getRawParameterValue("RATIO")->load();
         const float mixParam = apvts.getRawParameterValue("MIX")->load() * 0.01f;
-        const float scFreq   = apvts.getRawParameterValue("SC_FILTER")->load(); // 20..250 Hz
+        const float scFreq   = apvts.getRawParameterValue("SC_FILTER")->load(); 
         const bool gritOn    = apvts.getRawParameterValue("GRIT")->load() > 0.5f;
 
         const float inGain   = juce::Decibels::decibelsToGain((inParam - 20.0f) * 0.9f);
         const float outGain  = juce::Decibels::decibelsToGain((outParam - 20.0f) * 0.9f);
 
-        // Tiempos estilo FET (1 = Rápido, 7 = Lento según serigrafía del panel)
-        const float attackMs  = juce::jmap(attParam, 1.0f, 7.0f, 0.05f, 5.0f);
+        const float attackMs  = juce::jmap(attParam, 1.0f, 7.0f, 0.02f, 2.0f);
         const float releaseMs = juce::jmap(relParam, 1.0f, 7.0f, 50.0f, 1100.0f);
-        const float attCoeff  = std::exp(-1.0f / (0.001f * attackMs * (float)currentSampleRate));
-        const float relCoeff  = std::exp(-1.0f / (0.001f * releaseMs * (float)currentSampleRate));
-
-        const float ratios[5] = { 4.0f, 8.0f, 12.0f, 20.0f, 25.0f };
+        
+        const float ratios[5] = { 4.0f, 8.0f, 12.0f, 20.0f, 35.0f };
         const float ratio     = ratios[juce::jlimit(0, 4, ratioIdx)];
         const bool allButtons = (ratioIdx == 4);
-        const float threshDb  = allButtons ? -24.0f : -18.0f;
+        const float threshDb  = allButtons ? -26.0f : -20.0f;
 
         scFilter.setCutoffFrequency(scFreq);
 
-        const int numCh = buffer.getNumChannels();
-        const int numSamples = buffer.getNumSamples();
+        juce::AudioBuffer<float> dryBuffer;
+        dryBuffer.makeCopyOf(buffer);
+
+        juce::dsp::AudioBlock<float> block(buffer);
+        auto oversampledBlock = oversampler.processSamplesUp(block);
+
+        const int numCh = static_cast<int>(oversampledBlock.getNumChannels());
+        const int numSamples = static_cast<int>(oversampledBlock.getNumSamples());
+        const double oversampledRate = currentSampleRate * 2.0;
+
+        const float attCoeff  = std::exp(-1.0f / (0.001f * attackMs * (float)oversampledRate));
+        const float relCoeff  = std::exp(-1.0f / (0.001f * releaseMs * (float)oversampledRate));
+
         float maxGrDb = 0.0f;
 
         for (int s = 0; s < numSamples; ++s)
         {
-            // Detector Sidechain con HPF
             float det = 0.0f;
             for (int ch = 0; ch < numCh; ++ch)
-                det = std::max(det, std::abs(buffer.getSample(ch, s) * inGain));
+                det = std::max(det, std::abs(oversampledBlock.getSample(ch, s) * inGain));
 
             float filteredDet = std::abs(scFilter.processSample(0, det));
 
@@ -141,21 +153,32 @@ public:
 
             for (int ch = 0; ch < numCh; ++ch)
             {
-                float dry = buffer.getSample(ch, s);
-                float wet = dry * inGain * compGain;
+                float wet = oversampledBlock.getSample(ch, s) * inGain * compGain;
 
                 if (gritOn || allButtons)
                 {
-                    float drive = (gritOn && allButtons) ? 2.4f : 1.65f;
+                    float drive = allButtons ? 2.8f : 1.75f;
                     wet = std::tanh(wet * drive) / std::tanh(drive);
                 }
 
                 wet *= outGain;
-                buffer.setSample(ch, s, dry * (1.0f - mixParam) + wet * mixParam);
+                oversampledBlock.setSample(ch, s, wet);
             }
         }
 
+        oversampler.processSamplesDown(block);
         currentGrDb.store(maxGrDb);
+
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+        {
+            auto* dryData = dryBuffer.getReadPointer(channel);
+            auto* wetData = buffer.getWritePointer(channel);
+
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+            {
+                wetData[sample] = (dryData[sample] * (1.0f - mixParam)) + (wetData[sample] * mixParam);
+            }
+        }
     }
 
     juce::AudioProcessorEditor* createEditor() override;
@@ -194,6 +217,7 @@ private:
     double currentSampleRate = 44100.0;
     float envelope = 0.0f;
     juce::dsp::StateVariableTPTFilter<float> scFilter;
+    juce::dsp::Oversampler<float> oversampler;
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout()
     {
@@ -248,7 +272,12 @@ public:
         }
         ratioBtns[0].setToggleState(true, juce::dontSendNotification);
 
+        // Permitir redimensionar la ventana libremente (Zoom In / Zoom Out) manteniendo proporciones
+        setResizable(true, true);
+        setResizeLimits(550, 234, 2200, 936);
+        getConstrainer()->setFixedAspectRatio(1100.0 / 468.0);
         setSize(1100, 468);
+
         startTimerHz(30);
     }
 
@@ -261,9 +290,8 @@ public:
     {
         g.drawImage(bg, getLocalBounds().toFloat());
 
-        // Aguja animada sobre el vúmetro (VU Meter)
         float gr = juce::jlimit(0.0f, 20.0f, proc.currentGrDb.load());
-        float norm = 1.0f - (gr / 20.0f); // Reposo a la derecha (0 dB), se mueve a la izquierda con GR
+        float norm = 1.0f - (gr / 20.0f);
         float angle = juce::jmap(norm, 0.0f, 1.0f, -0.65f, 0.45f);
 
         float pivotX = getWidth() * 0.728f;
@@ -278,7 +306,7 @@ public:
 
     void resized() override
     {
-        // Mapeado exacto sobre las perillas y botones de la imagen
+        // Los componentes se auto-escalan proporcionalmente al hacer zoom en la ventana
         inSlider.setBoundsRelative(0.088f, 0.285f, 0.120f, 0.310f);
         outSlider.setBoundsRelative(0.262f, 0.285f, 0.120f, 0.310f);
         attSlider.setBoundsRelative(0.435f, 0.205f, 0.068f, 0.165f);
