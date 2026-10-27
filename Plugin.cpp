@@ -272,7 +272,6 @@ public:
         }
         ratioBtns[0].setToggleState(true, juce::dontSendNotification);
 
-        // Permitir redimensionar la ventana libremente (Zoom In / Zoom Out) manteniendo proporciones
         setResizable(true, true);
         setResizeLimits(550, 234, 2200, 936);
         getConstrainer()->setFixedAspectRatio(1100.0 / 468.0);
@@ -306,7 +305,6 @@ public:
 
     void resized() override
     {
-        // Los componentes se auto-escalan proporcionalmente al hacer zoom en la ventana
         inSlider.setBoundsRelative(0.088f, 0.285f, 0.120f, 0.310f);
         outSlider.setBoundsRelative(0.262f, 0.285f, 0.120f, 0.310f);
         attSlider.setBoundsRelative(0.435f, 0.205f, 0.068f, 0.165f);
